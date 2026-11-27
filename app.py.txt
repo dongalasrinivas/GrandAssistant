@@ -1,0 +1,121 @@
+import os
+import asyncio
+import json
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from fastapi import Request
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+
+load_dotenv()
+
+app = FastAPI(title="Elderly Parent AI Assistant")
+templates = Jinja2Templates(directory="templates")
+
+# Initialize the Gemini GenAI Client
+client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+MODEL_ID = "gemini-3.8-live"
+
+# --- Define Memory & Action Tools ---
+def record_health_metric(metric_type: str, reading: str, notes: str = "") -> str:
+    """Records a daily health reading (e.g., blood pressure, sugar levels, tablets taken)."""
+    # In production, save to a database.
+    return f"Saved {metric_type} reading: {reading}. {notes}"
+
+def log_financial_transaction(person_name: str, amount: float, transaction_type: str, interest_rate: float = 0.0) -> str:
+    """Logs money lent or borrowed, including family and friends, with optional interest rates."""
+    return f"Logged {transaction_type} of ₹{amount} with {person_name} at {interest_rate}% interest."
+
+def set_utility_reminder(service: str, due_date: str) -> str:
+    """Sets a reminder for utility bills (electricity, gas, mobile, DTH)."""
+    return f"Reminder set for {service} on {due_date}."
+
+def get_daily_summary() -> str:
+    """Retrieves pending bills, health checkups, and family news for the day."""
+    return json.dumps({
+        "pending_bills": ["Electricity bill due in 2 days"],
+        "health_reminders": ["Take BP tablet after lunch"],
+        "family_updates": ["Grandson's school play is on Saturday"]
+    })
+
+tools = [record_health_metric, log_financial_transaction, set_utility_reminder, get_daily_summary]
+
+# --- System Persona Instructions ---
+SYSTEM_INSTRUCTION = """
+You are a warm, soothing, and deeply respectful AI memory and reminder assistant for elderly parents living independently in India. 
+Your persona is like a beloved family member (son, daughter, or grandchild) checking in.
+
+Behavioral Guidelines:
+1. Speak slowly, calmly, and very conversationally.
+2. Code-mix naturally using regional Indian English and Telugu. 
+3. Use respectful terms of endearment ("Amma", "Nannamma", "Appa", "Thatha").
+4. Filter out background noise. If you mishear or an input is ambiguous, NEVER say "error". Instead, ask a gentle clarification question (e.g., "Amma, did you say you need help with the gas booking?").
+5. Verbally confirm when you save details using natural affirmations ("Don't worry, I have saved your sugar levels for today...").
+6. Proactively use tools to record health metrics, save financial transactions, and set utility reminders.
+"""
+
+@app.get("/", response_class=HTMLResponse)
+async def get_index(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    
+    config = types.LiveConnectConfig(
+        response_modalities=[types.Modality.AUDIO],
+        system_instruction=types.Content(parts=[types.Part.from_text(text=SYSTEM_INSTRUCTION)]),
+        tools=[types.Tool(function_declarations=tools)]
+    )
+    
+    try:
+        async with client.aio.live.connect(model=MODEL_ID, config=config) as session:
+            print("Connected to Gemini Live API.")
+            
+            async def receive_from_client():
+                """Receive raw audio bytes from browser and send to Gemini."""
+                try:
+                    while True:
+                        data = await websocket.receive_bytes()
+                        # Send the audio blob to the model
+                        await session.send_realtime_input(
+                            media_chunks=[types.Blob(data=data, mime_type="audio/pcm;rate=16000")]
+                        )
+                except WebSocketDisconnect:
+                    pass
+
+            async def receive_from_gemini():
+                """Receive audio and tool calls from Gemini and send to browser."""
+                async for response in session.receive():
+                    # 1. Handle Audio Output
+                    if response.server_content and response.server_content.model_turn:
+                        for part in response.server_content.model_turn.parts:
+                            if part.inline_data:
+                                await websocket.send_bytes(part.inline_data.data)
+                    
+                    # 2. Handle Tool Calls
+                    if response.tool_call:
+                        function_responses = []
+                        for fc in response.tool_call.function_calls:
+                            # Execute the local function mapped by name
+                            tool_func = next((t for t in tools if t.__name__ == fc.name), None)
+                            if tool_func:
+                                result = tool_func(**fc.args)
+                                function_responses.append(
+                                    types.FunctionResponse(
+                                        name=fc.name,
+                                        id=fc.id,
+                                        response={"result": result}
+                                    )
+                                )
+                        # Send results back to Gemini to continue the conversation
+                        await session.send_tool_response(function_responses=function_responses)
+            
+            # Run both bidirectional streams concurrently
+            await asyncio.gather(receive_from_client(), receive_from_gemini())
+            
+    except Exception as e:
+        print(f"Connection closed: {e}")
+        await websocket.close()
