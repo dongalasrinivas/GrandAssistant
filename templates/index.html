@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voice Assistant for Parents</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            background-color: #f0fdf4;
+            margin: 0;
+            color: #166534;
+        }
+        #mic-btn {
+            background-color: #22c55e;
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 150px;
+            height: 150px;
+            font-size: 24px;
+            cursor: pointer;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+            transition: all 0.3s;
+        }
+        #mic-btn.active {
+            background-color: #ef4444;
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+            100% { transform: scale(1); }
+        }
+        .status { margin-top: 20px; font-size: 18px; }
+    </style>
+</head>
+<body>
+
+    <button id="mic-btn">Start Talking</button>
+    <div class="status" id="status-text">Click to connect with the assistant...</div>
+
+    <script>
+        let ws;
+        let audioContext;
+        let isRecording = false;
+
+        const micBtn = document.getElementById('mic-btn');
+        const statusText = document.getElementById('status-text');
+
+        micBtn.addEventListener('click', async () => {
+            if (!isRecording) {
+                await startSession();
+            } else {
+                stopSession();
+            }
+        });
+
+        async function startSession() {
+            try {
+                // Initialize WebSocket
+                ws = new WebSocket(`ws://${window.location.host}/ws`);
+                ws.binaryType = 'arraybuffer';
+                
+                // Initialize Audio Context (16kHz for Gemini)
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                
+                // Get Microphone access
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                const source = audioContext.createMediaStreamSource(stream);
+                const processor = audioContext.createScriptProcessor(4096, 1, 1);
+                
+                source.connect(processor);
+                processor.connect(audioContext.destination);
+                
+                // Stream Mic to Backend
+                processor.onaudioprocess = (e) => {
+                    if (ws.readyState === WebSocket.OPEN) {
+                        const inputData = e.inputBuffer.getChannelData(0);
+                        // Convert Float32 to Int16 PCM
+                        const pcmData = new Int16Array(inputData.length);
+                        for (let i = 0; i < inputData.length; i++) {
+                            pcmData[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
+                        }
+                        ws.send(pcmData.buffer);
+                    }
+                };
+
+                // Play Audio from Backend
+                ws.onmessage = async (event) => {
+                    const audioData = event.data;
+                    const audioBuffer = await audioContext.decodeAudioData(audioData);
+                    const sourceNode = audioContext.createBufferSource();
+                    sourceNode.buffer = audioBuffer;
+                    sourceNode.connect(audioContext.destination);
+                    sourceNode.start();
+                };
+
+                isRecording = true;
+                micBtn.classList.add('active');
+                micBtn.innerText = 'Listening...';
+                statusText.innerText = "Speak to the assistant (English/Telugu)";
+
+            } catch (err) {
+                console.error("Error accessing mic or socket:", err);
+                statusText.innerText = "Error connecting. Please try again.";
+            }
+        }
+
+        function stopSession() {
+            if (ws) ws.close();
+            if (audioContext) audioContext.close();
+            isRecording = false;
+            micBtn.classList.remove('active');
+            micBtn.innerText = 'Start Talking';
+            statusText.innerText = "Session ended.";
+        }
+    </script>
+</body>
+</html>
